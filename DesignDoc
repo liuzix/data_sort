@@ -1,0 +1,29 @@
+设计文档
+
+数据流的处理共经过四阶段：
+1. 预处理阶段
+2. Push阶段
+3. Pop阶段
+4. 输出阶段
+
+其中1阶段由PreProcessor, 2、3阶段由Sorter(interface, 目前仅有concurrentSorter一个实现)，4阶段由Sink(interface，目前有StdOutSink和RateLimiter两个实现）来负责。
+设计中在关键部分采用了interface设计，主要是考虑到可扩展性和各组件的可插拔性。
+
+算法如下：
+1. PreProcessor负责将从一个给定的channel中读取的数据排序。
+   根据channel的linearizability和基本的并发编程的知识，可以推断出如果msg2的prepare在msg1的commit之后被收到，那么msg2.commit > msg1.commit.
+   PreProcessor将所有收到的待处理的消息储存，维护一个以prepare为key的map，和一个以commit为priority的优先队列。我们容易推断出如果我们收到一条msg2.commit消息，
+   那么在此之后收到的任何commit只有两种可能1) 对应msg3.prepare, 其中msg3在msg2以后收到 2）对应msg1.prepare，其中msg1在msg2以前收到。
+   如果是第一个情况，则msg3.commit > msg3.prepare > msg2.commit；如果是第二种情况，则msg3.commit > msg3.prepare >= min(目前未commit的消息的prepare)。
+   由此我们可以看出，如果msg2之前收到的任何msg的commit满足msg.commit < msg2.commit且msg.commit < min(目前未commit的消息的prepare)，那么
+   msg3.commit > msg.commit，所以msg可以被安全输出，因为任何msg3不可能被排序在msg前。
+2. concurrentSorter中的pusher负责从一些给定的channel，并把这些数据加入到perStreamQueue中。每个pusher线程维护一个perStreamQueue的优先队列，
+    根据perStreamQueue中最老消息的commit来排序。pusher线程的数量可设置。
+3. concurrentSorter中的popper是负责将所有perStreamQueue中有最小commit的msg输出到sink中的线程。popper线程只有1个。因为每个perStreamQueue中的
+    消息的commit由老到新递增（由PreProcessor保证），我们可以在所有的储存着perStreamQueue的优先队列的最小元素中寻找有最小commit的消息并输出。
+4. sink为简单的输出算法。RateLimiter实现了输出流控，用来控制cpu占用。
+
+说明：
+1. 我采取了多个Pusher的设计来减少对锁的竞争，因为优先队列很难做到无锁。
+2. 内存控制由限制perStreamQueue的长度实现，该长度可调。
+3. 在流控算法中采取的sleep而不是condvar，因为condvar有可能涉及到对锁的竞争。
